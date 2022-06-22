@@ -1,0 +1,604 @@
+---
+title: "Accessing Twitter Data Using rtweet"
+---
+
+
+# Introduction
+
+This file uses contains code to access Tweets from the Twitter API. Much of the initial code was taken from this excellent lab (https://mkearney.github.io/nicar_tworkshop/#1), created by the mkearney - the developer of rtweet.
+
+
+
+# Library necessary packages
+```{r}
+library(rtweet)
+library(tidyverse)
+library(tidytext)
+library(textdata)
+library(dplyr)
+library(stringr)
+library(tidyr)
+library(lubridate)
+library(ggplot2)
+library(RColorBrewer)
+library(gridExtra)
+library(sentimentr)
+```
+
+
+
+# Set rootpath
+```{r}
+# Set rootpath to wherever you have cloned the GitHub repository to
+rp <- "C:/Users/sgmmahon/Documents/GitHub/iom_project/"
+
+# Define path to accessing_tweets directory
+at <- "methods/accessing_tweets/"
+```
+
+
+
+# Create Twitter token
+```{r}
+# Create token
+token <- create_token(
+  app = "GDS Analysis",
+  consumer_key = "38Vl2dWJnq9f1E4IwxCP8KayZ",
+  consumer_secret = "pUmwnjjxo7Gnfe8nMyBXuIUy4U8GH0EuvRIkdnd8nyk6fCpmch",
+  access_token = "1065962179806052352-f8B4U1JWaAM6h6uIe5PnrvPHaCVu29",
+  access_secret = "dZzhsfM1up9uoR7WB6CKAXK8NS3WXoDUjaCGd9Kvf99EL",
+  set_renv = FALSE )
+
+# Save token
+path_to_token <- paste0(rp,at,"twitter_token.rds")
+saveRDS(token, path_to_token)
+
+# Create env variable TWITTER_PAT (with path to saved token)
+env_var <- paste0("TWITTER_PAT=", path_to_token)
+
+# Save as .Renviron file (or append if the file already exists)
+cat(env_var, file = paste0(rp,at,".Renviron"), fill = TRUE)
+
+# Refresh .Renviron variables
+readRenviron(paste0(rp,at,".Renviron"))
+```
+
+
+
+
+# Define geographies for 5 countries within study
+
+rtweet uses a function call lookup_coords() to obtain the geographies of specific regions. This function relies on the Google Geocoding API. Given that Google charges for use of its API and this study only requires 5 geographies, I decided to simply use define these regions manually based on the outputs from a single call of the API. These are defined below.
+```{r}
+# Define function which creates geographies that mimic rtweet's lookup_coords() output
+assign_coords <- function(x) {
+  coords <- list(place = x[[1]],
+                 box = x[[2]],
+                 point = x[[3]])
+  names(coords$box)   <- c("sw.lng", "sw.lat", "ne.lng", "ne.lat")
+  names(coords$point) <- c("lat", "lng")
+  class(coords)       <- c("coords", "list")
+  return(coords)
+}
+
+# Define input features for function
+ukvars    <- list("UK",c(-8.89890, 34.56140, 33.91655, 60.91570),c(55.378051, -3.435973))
+usavars   <- list("usa",c(-124.84897, 24.39631, -66.88544, 49.38436),c(36.890, -95.867))
+spainvars <- list("spain",c(-18.2648, 27.4985, 4.6362, 43.8504),c(40.46367, -3.74922))
+italyvars <- list("italy",c(6.62672, 35.48970, 18.79760, 47.09200),c(41.87194, 12.56738))
+grmanvars <- list("germany",c(5.866343, 47.270111, 15.041896, 55.081500),c(51.16569, 10.45153))
+
+# Create geographies
+uk_coords    <- assign_coords(ukvars)
+usa_coords   <- assign_coords(usavars)
+spain_coords <- assign_coords(spainvars)
+italy_coords <- assign_coords(italyvars)
+grman_coords <- assign_coords(grmanvars)
+
+# View results
+#uk_coords
+```
+
+
+
+# Define search terms
+```{r}
+search_terms_en <- list(
+  
+  # Migrant terms
+  neutral_migrant_terms_1 = c("immigrant", "immigration", "migrant", "migration", "\"asylum seeker\"", "refugee", "\"undocumented worker\""), 
+  neutral_migrant_terms_2 = c("\"guest worker\"", "\"EU worker\"", "\"non-UK workers\"", "\"foreign worker\"", "(human smuggling)", 
+                              "(human trafficking)"),
+  negative_migrant_terms  = c("illegals", "foreigner", "\"illegal alien\"", "\"illegal worker\""),
+  
+  # Racial terms
+  #neutral_racial_terms    = c("china", "chinese", "Asian", "\"china town\"", "chinatown", "japan", "Japanese", "korea", "Korean", "Africa", "African",
+  #                           "Vietnam", "Vietnamese", "muslim", "islam", "ethnic", "gypsy", "polish", "poles", "Romanian"),
+  
+  negative_racial_terms   = c("islamophob", "sinophob", "\"china flu\"", "\"kung flu\"", "\"china virus\"", "\"chinese virus\"", "shangainese"),
+  
+  # Twitter accounts
+  pro_migrant_account_1   = c("@UNmigration", "@IOM_UN", "@IOMatUN", "@IOMatEU", "@IOM_UK", "@IOMResearch", "@IOM_GMDAC", "@hrw", "@Right_to_Remain"),
+  pro_migrant_account_2   = c("@CommonsHomeAffs", "@fcukba", "@Mark_George_QC", "@MigrantVoiceUK", "@MigrantChildren", "@MigrantHelp", "@thevoiceofdws"),
+  pro_migrant_account_3   = c("@WORCrights", "@UbuntuGlasgow", "@MigrantsUnionUK", "@migrants_rights", "@MigrantsMRC", "@Consenant_UK", "@RomaSupport"),
+  pro_migrant_account_4   = c("@MigrantsLawProj", "@MigRightsScot", "@IRMOLondon", "@HighlySkilledUK", "@WeBelong19", "@Project17UK"),
+  neutral_account         = c("@ukhomeoffice", "@pritipatel", "@UKHomeSecretary", "@EUHomeAffairs", "@MigrMatters", "@MigObs"),
+  anti_migrant_account    = c("@Nigel_Farage", "@MigrationWatch"),
+  
+  # Hashtags
+  positive_hashtags       = c("#RefugeesWelcome", "#MigrantsWelcome", "#LeaveNoOneBehind", "#FreedomForImmigrants", "#illegalmigantsUK", "#LondonIsOpen",
+                              "#EndHostileEnvironment", "#FamiliesBelongTogether"),
+  neutral_hashtags        = c("#Pritiuseless", "#migrationEU", "#immigration", "#migration", "#immigrant", "#migrant", "#immigrate", "#migrate", "#refugees",
+                             "#NigelFarage", "#ImmigrationReform"),
+  negative_hashtags_1     = c("#illegals", "#foreigner", "#foreigners", "#illegalalien", "#illegalaliens", "#illegalworker", "#OurCountry", "#illegalworkers"),
+  negative_hashtags_2     = c("#KeepThemOut", "#SendThemBack", "#migrantsnotwelcome", "#refugeesnotwelcome", "#illegals", "#ChinaVirus", "#chinaflu"),
+  negative_hashtags_3     = c("#kungflu", "#chinesevirus", "#TheyHaveToGoBack", "#DeportThemAll"),
+  event_hashtags          = c("#Moria", "#CampFire", "#closethecamps")
+  
+)
+
+search_terms_it <- list(
+  
+  # Migrant terms
+  italy_neutral_migrant_terms  = c("Immigrat", "richiedent", "asilo", "person", "irregolar", "migrant", "stranier", "rifugiat", "cittadinanza", "nazionalità", 
+                                  "\"vittima di tratta\"", "\"minore non accompagnato\"", "\"traffico di migranti\"", "sbarco", "sbarchi"),
+  italy_negative_migrant_terms = c("Clandestin", "illegal", "profug", "immigrat", "abusiv", "invasione"),
+  
+  # Racial terms
+  #italy_neutral_racial_terms   = c("\"Persona di colore\"", "\"Persone di colore\"", "afrodiscendent", "person", "near", "african", "oriental", "marocchin",
+  #                                 "Senegales", "tunisin", "cines", "asiatic", "nigerian", "rom", "arab", "magrebin", "razzismo", "discriminazione"),
+  italy_negative_racial_terms  = c("zingar", "negr", "sporco", "sporch", "scimmi", "zingar", "extracomunitari"),
+  
+  # Twitter accounts
+  italy_pro_migrant_account_1  = c("@UNmigration", "@IOM_UN", "@IOMatUN", "@IOMatEU", "@IOMResearch", "@OIMItalia", "@IOM_GMDAC", "@LHartIOM", "@hrw",
+                                   "@Refugees", "@MSF_Sea", "@RefugeesIntl", "@DetentionForum", "@OpenSociety", "@Amnesty", "@FilippoGrandi", "@IOMchief",
+                                   "@UNSR_Migration", "@PICUM_post", "@seawatch_intl"),
+  italy_pro_migrant_account_2  = c("@emergency_ong", "@amnestyitalia", "@SeaWatchItaly", "@BaobabExp", "@aboubakar_soum", "@CaritasItaliana", "@cartadiroma",
+                                   "@caritas_milano", "@open_migration", "@Medhope_FCEI", "@MSF_ITALIA", "@OIMItalia", "@UNHCRItalia", "@SOSMedItalia"),
+  italy_pro_migrant_account_3  = c("@openarms_it", "@RescueMed", "@UNICEF_Italia", "@valigiablu", "@OxfamItalia", "@CIRRIFUGIATI", "@SaveChildrenIT",
+                                   "@InMigrazione", "@Pontifex", "@CentroAstalli"),
+  italy_neutral_account        = c("@Viminale", "@EUHomeAffairs", "@GiuseppeConteIT", "@ItalyMFA"),
+  italy_anti_migrant_account   = c("@matteosalvinimi", "@giorgiameloni", "@CasaPoundItalia", "@ForzaNuova", "@FratellidItalia", "@LegaSalvini", "@Dsantanche",
+                                   "@ilgiornale", "@Libero_official", "@lumorisi", "@RobertoFioreFN"),
+  italy_positive_hashtags_1    = c("#portiaperti", "#apriamoiporti", "#aprireiporti", "#accoglienza", "#bastarazzismo", "#fatelientrare", "#SeaWatch",
+                                   "#SeaEye", "#Openarms", "#TuttiFratelli", "#3ottobre"), 
+  italy_positive_hashtags_1    = c("#restiamoumani", "#regolarizzazione", "#corridoiumanitari", "#solidarieta", "#dirittodiasilo", "#ioaccolgo"),
+  italy_neutral_hashtags       = c("#DecretiSicurezza", "#decretoimmigrazione", "#migranti", "#migrazioni", "#immigrati", "#immigrazione", "#SAR",
+                                   "#searchandrescue", "#stranieri", "#richiedentiasilo", "#asilo", "#rifugiati", "#integrazione", "#ONG", "#iussoli",
+                                   "#decretiSalvini", "#razzismo", "#cittadinanza", "#MareNostrum", "#reinsediamento", "#rimpatri", "#Mediterraneo",
+                                   "#RegolamentoDublino", "#hotspot", "#tratta"),
+  italy_negative_hashtags      = c("#portichiusi", "#tolleranzazero", "#descretisicurezza", "#decretosalvini", "#decretoimmigrazione", "#BloccoNavale",
+                                   "#blocconavalesubito", "#chiudiamoiporti", "#invasione", "#lamorgesedimettiti", "#extracomunitari", "#clandestini",
+                                   "#profughi", "#irregolari", "#ItaliaAgliItaliani", "#aiutiamoliacasaloro", "#primagliitaliani", "#Decretoclandestini",
+                                   "#DifendiamolItalia", "#iostoconSalvini"),
+  italy_event_hashtags         = c("#Moria", "#Etienne", "#Abou", "#Lesbo", "#WillyMonteroDuarte", "#WillyMonteiro")
+
+)
+
+# Country Search Terms
+uk_add_terms     = ' (place_country:GB OR profile_country:GB) '
+usa_add_terms    = ' (place_country:US OR profile_country:US) '
+spain_add_terms  = ' (place_country:ES OR profile_country:ES) '
+italy_add_terms  = ' (place_country:IT OR profile_country:IT) '
+grman_add_terms  = ' (place_country:DE OR profile_country:DE) '
+```
+
+# Access tweets
+```{r}
+# Function which concatonates search terms into a single string
+stcat <- function(x) {
+  paste0("(", paste(x, collapse = " OR "), ")")
+}
+
+# Function which searches for tweets in a specified geography, in a specified language, that are not retweets
+tweet_search_criteria <- function(x,y,z) {
+  twts <- search_tweets(q = stcat(x), lang = y, geocode = z,
+                        include_rts = FALSE, n = 18000, retryonratelimit = TRUE)
+}
+
+# Search for tweets
+#tweets_list <- list()
+#for (i in 1:length(search_terms)) {
+#  tweets_list[[i]] <- tweet_search_criteria(search_terms[[i]], "en", uk_coords)
+#  cat("\r",i," of ",length(search_terms)," complete.")
+#}
+```
+
+
+```{r}
+# Save tweets
+#saveRDS(tweets_list, paste0(rp, "data/tweet_data/tweets/7_day_sample_04102020_13102020.RData"))
+```
+
+```{r}
+# Read in tweets
+tweets_list <- readRDS(paste0(rp, "data/tweet_data/tweets/7_day_sample_04102020_13102020.RData"))
+```
+
+# Format tweets
+```{r}
+# Clean tweets
+tweets <- tweets_list %>% 
+  # rbind different all dataframes together
+  do.call(rbind, .) %>%
+  # Keep only unique cases
+  distinct(status_id, .keep_all = TRUE) %>%
+  # Order tweets by date-time
+  .[order(.$created_at, decreasing = TRUE),] %>%
+  # Convert text to lowercase
+  mutate(full_text_cleaned = text %>% str_to_lower) %>%
+  # Remove unwanted characters
+  mutate(full_text_cleaned = full_text_cleaned %>% str_remove_all(pattern = '\\n')) %>% 
+  mutate(full_text_cleaned = full_text_cleaned %>% str_remove_all(pattern = '&amp')) %>% 
+  # Remove websites
+  mutate(full_text_cleaned = full_text_cleaned %>% str_remove_all(pattern = 'https://t.co/[a-z,A-Z,0-9]*')) %>% 
+  mutate(full_text_cleaned = full_text_cleaned %>% str_remove_all(pattern = 'http://t.co/[a-z,A-Z,0-9]*')) %>% 
+  mutate(full_text_cleaned = full_text_cleaned %>% str_remove_all(pattern = 'https')) %>% 
+  mutate(full_text_cleaned = full_text_cleaned %>% str_remove_all(pattern = 'http')) %>% 
+  # Remove hashtags
+  mutate(full_text_cleaned = full_text_cleaned %>% str_remove_all(pattern = '#')) %>% 
+  # Remove entire hashtags (optional)
+  # mutate(full_text_cleaned = full_text_cleaned %>% str_remove_all(pattern = '#[a-z,A-Z]*')) %>% 
+  # Remove accounts
+  mutate(full_text_cleaned = full_text_cleaned %>% str_remove_all(pattern = '@[a-z,A-Z]*')) %>% 
+  # Remove retweet text
+  mutate(full_text_cleaned = full_text_cleaned %>% str_remove_all(pattern = 'rt [a-z,A-Z]*: ')) %>% 
+  mutate(full_text_cleaned = full_text_cleaned %>% str_remove(pattern = '^(rt)')) %>% 
+  mutate(full_text_cleaned = full_text_cleaned %>% str_remove_all(pattern = '\\_')) %>%
+  mutate(full_text_cleaned = full_text_cleaned %>% str_remove_all(pattern = 'ht [a-z,A-Z]*: ')) %>% 
+  mutate(full_text_cleaned = full_text_cleaned %>% str_remove(pattern = '^(ht)'))
+
+
+# Create POSICxt variable at the day level
+tweets$day  <- format(tweets$created_at, "%Y-%m-%d")
+
+# Create date-time variable at the hour level
+tweets$hour_dt <- format(tweets$created_at, "%Y-%m-%d %H")
+
+# Create numeric variable at the hour level
+tweets$hour_t <- format(tweets$created_at, "%H") %>% as.numeric()
+
+# Subset tweets to only include those on days where all hours are present
+tweets <- subset(tweets, tweets$day != "2020-10-13" & tweets$day != "2020-10-04" )
+```
+
+
+# Plot hourly tweets
+```{r}
+# Split tweets by hour
+tweets_hsplt <- split(tweets, tweets$hour_dt)
+
+# lapply function which get the number of tweets within each split dataframe
+tweets_hrntw <- lapply(tweets_hsplt, function(x) x <- nrow(x))
+
+# Plot hourly tweets
+plot(unlist(tweets_hrntw), type = "l", lty = 1)
+```
+
+# Sentiment Analysis
+```{r}
+extract_sentiments_coreNLP <- function(a) {
+  a$index <- 1:nrow(a) %/% 100
+  
+  no_tweets <- a %>% split(.$day) %>%
+    lapply(function(x) nrow(x) )
+  
+  whole_day <- a %>% 
+    split(.$day) %>%
+    lapply(function(x) split(x, x$index) ) %>%
+    lapply(function(x) lapply(x, function(y) get_sentences(as.character(y[,"full_text_cleaned"])) %>% sentiment() ) ) %>%
+    lapply(function(x) do.call(rbind, x) ) %>%
+    lapply(function(x) sum(x$sentiment)) %>%
+    mapply(function(x,y) x/y, ., no_tweets)
+  
+  midday <- a %>% 
+    subset(.$hour_t <= 13) %>% 
+    split(.$day) %>%
+    lapply(function(x) x[1:1500,]) %>%
+    lapply(function(x) split(x, x$index) ) %>%
+    lapply(function(x) lapply(x, function(y) get_sentences(as.character(y[,"full_text_cleaned"])) %>% sentiment() ) ) %>%
+    lapply(function(x) do.call(rbind, x) ) %>%
+    lapply(function(x) sum(x$sentiment)) %>%
+    lapply(function(x) x/1500 )
+    
+  
+  max_activity <- a %>% split(.$day) %>%
+    lapply(function(x) split(x, x$hour_dt) ) %>%
+    lapply(function(x) lapply(x, function(y) nrow(y) ) ) %>%
+    lapply(function(x) which.max(x) )
+  
+  max_hour <- a %>% split(.$day)
+  for (i in 1:length(max_hour)) {
+    max_hour[[i]] <- subset(max_hour[[i]], max_hour[[i]]$hour_t <= (max_activity[[i]]+1) )
+  }
+  max_hour <- lapply(max_hour, function(x) x[1:1500,]) %>%
+    lapply(function(x) split(x, x$index) ) %>%
+    lapply(function(x) lapply(x, function(y) get_sentences(as.character(y[,"full_text_cleaned"])) %>% sentiment() ) ) %>%
+    lapply(function(x) do.call(rbind, x) ) %>%
+    lapply(function(x) sum(x$sentiment)) %>%
+    lapply(function(x) x/1500 )
+  
+  sentiments <- data.frame(whole_day = unlist(whole_day),
+                           midday    = unlist(midday),
+                           max_hour  = unlist(max_hour)
+                           )
+  return(sentiments)
+}
+
+# Function which calculates the sentiment of each tweet using 
+# any of the tidytext libraries: nrc, afinn, bing
+tidy_tweets <- function(x,y) {
+  ttws <- x[,c("status_id","full_text_cleaned")] %>%
+    unnest_tokens(word, full_text_cleaned) %>%
+    inner_join(get_sentiments(y))
+  if (y == "nrc" | y == "bing") {
+    ttws <- ttws %>% filter(sentiment %in% c("positive","negative")) %>%
+      count(status_id, sentiment) %>%
+      spread(sentiment, n, fill = 0) %>%
+      mutate(sentiment = positive - negative)
+  } else {
+    ttws <- ttws %>% group_by(status_id) %>%
+      summarise(sentiment = sum(value))
+  }
+  ttws <- merge(tweets[,c("status_id","day","hour_t")], ttws, by = "status_id")
+  return(ttws)
+}
+
+extract_sentiments <- function(a,b) {
+  tidy_tweets <- tidy_tweets(a,b)
+  
+  no_tweets <- a %>% split(.$day) %>%
+    lapply(function(x) nrow(x) )
+  
+  whole_day <- a %>% 
+    split(.$day) %>%
+    lapply(function(x) tidy_tweets[(tidy_tweets$status_id %in% x$status_id),]) %>%
+    lapply(function(x) sum(x$sentiment)) %>%
+    mapply(function(x,y) x/y, ., no_tweets)
+  
+  midday <- a %>% 
+    subset(.$hour_t <= 13) %>% 
+    split(.$day) %>%
+    lapply(function(x) x[1:1500,]) %>%
+    lapply(function(x) tidy_tweets[(tidy_tweets$status_id %in% x$status_id),]) %>%
+    lapply(function(x) sum(x$sentiment)) %>%
+    lapply(function(x) x/1500 )
+    
+  
+  max_activity <- a %>% split(.$day) %>%
+    lapply(function(x) split(x, x$hour_dt) ) %>%
+    lapply(function(x) lapply(x, function(y) nrow(y) ) ) %>%
+    lapply(function(x) which.max(x) )
+  
+  max_hour <- a %>% split(.$day)
+  for (i in 1:length(max_hour)) {
+    max_hour[[i]] <- subset(max_hour[[i]], max_hour[[i]]$hour_t <= (max_activity[[i]]+1) )
+  }
+  max_hour <- lapply(max_hour, function(x) x[1:1500,]) %>%
+    lapply(function(x) tidy_tweets[(tidy_tweets$status_id %in% x$status_id),]) %>%
+    lapply(function(x) sum(x$sentiment)) %>%
+    lapply(function(x) x/1500 )
+  
+  sentiments <- data.frame(whole_day = unlist(whole_day),
+                           midday    = unlist(midday),
+                           max_hour  = unlist(max_hour)
+                           )
+  return(sentiments)
+}
+
+tidy_tweets_nrc <- function(x,y) {
+  ttws <- x[,c("status_id","full_text_cleaned")] %>%
+    unnest_tokens(word, full_text_cleaned) %>%
+    inner_join(get_sentiments("nrc")) %>% 
+    filter(sentiment %in% y) %>%
+    count(status_id, sentiment) %>%
+    spread(sentiment, n, fill = 0) %>%
+    merge(tweets[,c("status_id","day","hour_t")], ., by = "status_id")
+  names(ttws) <- c("status_id", "day", "hour_t", "sentiment")
+  return(ttws)
+}
+
+extract_nrc_emotions <- function(a,b) {
+  tidy_tweets <- tidy_tweets_nrc(a,b)
+  
+  no_tweets <- a %>% split(.$day) %>%
+    lapply(function(x) nrow(x) )
+  
+  whole_day <- a %>% 
+    split(.$day) %>%
+    lapply(function(x) tidy_tweets[(tidy_tweets$status_id %in% x$status_id),]) %>%
+    lapply(function(x) sum(x$sentiment)) %>%
+    mapply(function(x,y) x/y, ., no_tweets)
+
+  midday <- a %>% 
+    subset(.$hour_t <= 13) %>% 
+    split(.$day) %>%
+    lapply(function(x) x[1:1500,]) %>%
+    lapply(function(x) tidy_tweets[(tidy_tweets$status_id %in% x$status_id),]) %>%
+    lapply(function(x) sum(x$sentiment)) %>%
+    lapply(function(x) x/1500 )
+    
+  
+  max_activity <- a %>% split(.$day) %>%
+    lapply(function(x) split(x, x$hour_dt) ) %>%
+    lapply(function(x) lapply(x, function(y) nrow(y) ) ) %>%
+    lapply(function(x) which.max(x) )
+  
+  max_hour <- a %>% split(.$day)
+  for (i in 1:length(max_hour)) {
+    max_hour[[i]] <- subset(max_hour[[i]], max_hour[[i]]$hour_t <= (max_activity[[i]]+1) )
+  }
+  max_hour <- lapply(max_hour, function(x) x[1:1500,]) %>%
+    lapply(function(x) tidy_tweets[(tidy_tweets$status_id %in% x$status_id),]) %>%
+    lapply(function(x) sum(x$sentiment)) %>%
+    lapply(function(x) x/1500 )
+  
+  sentiments <- data.frame(whole_day = unlist(whole_day),
+                           midday    = unlist(midday),
+                           max_hour  = unlist(max_hour)
+                           )
+  return(sentiments)
+}
+
+plot_graph <- function(x,y) {
+  graph_data <- x %>% mutate(day = rownames(.)) %>%
+    gather(method, sentiment, whole_day:max_hour, factor_key = TRUE) %>%
+    .[order(.$day),] %>% arrange()
+  
+  graph <- ggplot(graph_data, aes(x = day, y = sentiment, fill = method)) +
+    geom_bar(stat='identity', position=position_dodge()) +
+    theme_light() + 
+    ggtitle(paste0(y, " Sentiment Comparison")) +
+    theme(plot.title = element_text(hjust=0.5)) +
+    scale_fill_manual(name="Method", labels=c("Whole Day", "Midday", "Max Hour"), values=c("#737373", "#78C679", "#3690C0")) +
+    xlab("") +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1)) +
+    ylab("Sentiment")
+  return(graph)
+}
+```
+
+
+
+```{r}
+coreNLP_sentiments <- extract_sentiments_coreNLP(tweets)
+afinn_sentiments   <- extract_sentiments(tweets, "afinn")
+bing_sentiments    <- extract_sentiments(tweets, "bing")
+nrc_sentiments     <- extract_sentiments(tweets, "nrc")
+nrc_anger          <- extract_nrc_emotions(tweets, "anger")
+nrc_anticipation   <- extract_nrc_emotions(tweets, "anticipation")
+nrc_disgust        <- extract_nrc_emotions(tweets, "disgust")
+nrc_fear           <- extract_nrc_emotions(tweets, "fear")
+nrc_joy            <- extract_nrc_emotions(tweets, "joy")
+nrc_sadness        <- extract_nrc_emotions(tweets, "sadness")
+nrc_surprise       <- extract_nrc_emotions(tweets, "surprise")
+nrc_trust          <- extract_nrc_emotions(tweets, "trust")
+```
+
+```{r, fig.width=14, fig.length=20}
+nlp          <- plot_graph(coreNLP_sentiments, "coreNLP")
+afinn        <- plot_graph(afinn_sentiments, "AFINN")
+bing         <- plot_graph(bing_sentiments, "Bing")
+nrc          <- plot_graph(nrc_sentiments, "NRC")
+anger        <- plot_graph(nrc_anger, "NRC Anger")
+anticipation <- plot_graph(nrc_anticipation, "NRC Anticipation")
+disgust      <- plot_graph(nrc_disgust, "NRC Disgust")
+fear         <- plot_graph(nrc_fear, "NRC Fear")
+joy          <- plot_graph(nrc_joy, "NRC Joy")
+sadness      <- plot_graph(nrc_anticipation, "NRC Sadness")
+surprise     <- plot_graph(nrc_anticipation, "NRC Surprise")
+trust        <- plot_graph(nrc_anticipation, "NRC Trust")
+
+grid.arrange(nlp, afinn, bing, 
+             nrc, anger, anticipation, 
+             disgust, fear, joy, 
+             sadness, surprise, trust, ncol = 3)
+```
+
+```{r, fig.width=14, fig.length=20}
+png(file= paste0(rp,"fig/sentiment_lexicons_test.png"), units="px", width=4000, height=2800, res=300)
+grid.arrange(nlp, afinn, bing, 
+             nrc, anger, anticipation, 
+             disgust, fear, joy, 
+             sadness, surprise, trust, ncol = 3)
+dev.off()
+```
+
+
+
+```{r}
+sentiment_correlation <- data.frame(
+  
+  emotion  = c("NLP", "AFINN", "Bing", "NRC", "NRC Anger", "NRC Anticipation", "NRC Disgust", 
+               "NRC Fear", "NRC Joy", "NRC Sadness", "NRC Surprise", "NRC Trust"),
+  
+  midday   = c(stats::cor(coreNLP_sentiments$whole_day,coreNLP_sentiments$midday, method = "spearman"),
+               stats::cor(afinn_sentiments$whole_day,afinn_sentiments$midday, method = "spearman"),
+               stats::cor(bing_sentiments$whole_day,bing_sentiments$midday, method = "spearman"),
+               stats::cor(nrc_sentiments$whole_day,nrc_sentiments$midday, method = "spearman"),
+               stats::cor(nrc_anger$whole_day,nrc_anger$midday, method = "spearman"),
+               stats::cor(nrc_anticipation$whole_day,nrc_anticipation$midday, method = "spearman"),
+               stats::cor(nrc_disgust$whole_day,nrc_disgust$midday, method = "spearman"),
+               stats::cor(nrc_fear$whole_day,nrc_fear$midday, method = "spearman"),
+               stats::cor(nrc_joy$whole_day,nrc_joy$midday, method = "spearman"),
+               stats::cor(nrc_sadness$whole_day,nrc_sadness$midday, method = "spearman"),
+               stats::cor(nrc_surprise$whole_day,nrc_surprise$midday, method = "spearman"),
+               stats::cor(nrc_trust$whole_day,nrc_trust$midday, method = "spearman") ),
+  
+  max_hour = c(stats::cor(coreNLP_sentiments$whole_day,coreNLP_sentiments$max_hour, method = "spearman"),
+               stats::cor(afinn_sentiments$whole_day,afinn_sentiments$max_hour, method = "spearman"),
+               stats::cor(bing_sentiments$whole_day,bing_sentiments$max_hour, method = "spearman"),
+               stats::cor(nrc_sentiments$whole_day,nrc_sentiments$max_hour, method = "spearman"),
+               stats::cor(nrc_anger$whole_day,nrc_anger$max_hour, method = "spearman"),
+               stats::cor(nrc_anticipation$whole_day,nrc_anticipation$max_hour, method = "spearman"),
+               stats::cor(nrc_disgust$whole_day,nrc_disgust$max_hour, method = "spearman"),
+               stats::cor(nrc_fear$whole_day,nrc_fear$max_hour, method = "spearman"),
+               stats::cor(nrc_joy$whole_day,nrc_joy$max_hour, method = "spearman"),
+               stats::cor(nrc_sadness$whole_day,nrc_sadness$max_hour, method = "spearman"),
+               stats::cor(nrc_surprise$whole_day,nrc_surprise$max_hour, method = "spearman"),
+               stats::cor(nrc_trust$whole_day,nrc_trust$max_hour, method = "spearman") ) 
+)
+
+sentiment_correlation
+```
+
+
+
+```{r, fig.width=14}
+graph_data <- sentiment_correlation %>% gather(method, correlation, midday:max_hour, factor_key = TRUE) %>%
+  .[order(.$emotion),] %>% arrange()
+
+sentiment_lexicons_corr <- ggplot(graph_data, aes(x = emotion, y = correlation, fill = method)) +
+  geom_bar(stat='identity', position=position_dodge()) +
+  theme_light() + 
+  ggtitle("Comparison of Midday & Max-Hour\nSamples to Whole Day Sentiment") +
+  theme(plot.title = element_text(hjust=0.5)) +
+  scale_fill_manual(name="Method", labels=c("Midday", "Max Hour"), values=c("#78C679", "#3690C0")) +
+  scale_y_continuous(limits = c(-1, 1)) +
+  xlab("") +
+  ylab("Correlation with Whole Day Sentiment")
+sentiment_lexicons_corr
+```
+
+```{r, fig.width=14, fig.length=20}
+png(file= paste0(rp,"fig/sentiment_lexicons_correlation.png"), units="px", width=4000, height=2800, res=300)
+sentiment_lexicons_corr
+dev.off()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Code for selecting colour pallettes
+```{r}
+# Hexadecimal color specification 
+brewer.pal(n = 8, name = "Greys")
+```
+
+```{r}
+# View a single RColorBrewer palette by specifying its name
+display.brewer.pal(n = 8, name = 'Greys')
+```
+
+```{r, fig.height=7}
+display.brewer.all()
+```
+
+
+

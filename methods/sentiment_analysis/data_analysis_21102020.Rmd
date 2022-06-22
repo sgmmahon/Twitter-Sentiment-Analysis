@@ -1,0 +1,476 @@
+---
+title: "Twitter Data Analysis"
+author: "F Rowe"
+output: html_notebook
+---
+
+```{r}
+rm(list=ls())
+```
+
+# Library necessary packages
+```{r}
+library(rtweet)
+library(tidyverse)
+library(tidytext)
+library(textdata)
+library(dplyr)
+library(stringr)
+library(tidyr)
+library(plyr)
+library(lubridate)
+library(ggplot2)
+library(RColorBrewer)
+library(gridExtra)
+library(sentimentr)
+library(ggthemes)
+library(showtext)
+library(wordcloud)
+```
+
+# Data Wrangling
+```{r}
+# Read in tweets FRO
+tweets <- read_csv("../data/uk_tweets.csv")
+str(tweets)
+```
+
+```{r}
+# Read in tweets MMA
+
+# Set rootpath to cloned GitHub repository
+rp <- "C:/Users/sgmmahon/Documents/GitHub/iom_project/"
+
+# Define path to data
+dp <- "data/tweet_data/tweets/"
+
+# Define path to methods
+mp <- "methods/sentiment_analysis/"
+
+# Read in tweets
+tweets <- read_csv(paste0(rp, dp, "uk_tweets_01122019_01052020_VADER_removed_dpl_RT_and_status_id_only.csv"))
+
+# Remove index column
+tweets$X1 <- NULL
+
+# Assign Country ID
+tweets$cntry_id <- 1 # uk
+
+# Create date column
+tweets$date <- as.Date(substr(as.character(tweets$created_at),1,10))
+```
+
+
+
+# Sentiment Analysis
+```{r}
+get_sentiments_coreNLP <- function(a) {
+  # Define a subset of variables from existing tweets dataframe to be kept once sentiment has been obtained
+  imp_var <- c("user_id", "status_id", "created_at", "VADER_text", "date")
+
+  # Prep the data
+  data_prep <- a %>%
+    # Subset variables by imp_var
+    .[,imp_var] %>%
+    # Split the tweets by day
+    split(.$date) %>%
+    # A new variable 'element_id' is added to help with merging later
+    lapply(function(x) { x$element_id <- 1:nrow(x); return(x) } )
+
+  # Obtain sentiment scores
+  sentiments <- data_prep %>%
+    # This function breaks tweets up into individual sentences and calculates their sentiment scores
+    lapply(function(x) get_sentences(x$VADER_text) %>% sentiment() ) %>%
+    # This object is then converted to a dataframe (it was a datatable and dataframe for some reason)
+    lapply(function(x) as.data.frame(x) )
+
+  # for loop which merges the sentiment scores with the original twitter data
+  for (i in 1:length(sentiments)) {
+    # Remove attribute sentences (which was making merging impossible)
+    attr(sentiments[[i]], "sentences") <- NULL
+    # Merge dataframes within data_prep with equivalent dataframes in sentiments on common variable 'element_id'
+    sentiments[[i]] <- merge(data_prep[[i]], sentiments[[i]], by = "element_id" )
+    # Drop 'element_id' (can now be substituted with 'status_id')
+    sentiments[[i]][,c("element_id")] <- NULL
+  }
+
+  # rbind dataframes back into single dataframe
+  sentiments <-  do.call(rbind, sentiments)
+
+  # Reset row.names of dataframe
+  row.names(sentiments) <- 1:nrow(sentiments)
+
+  sentiments <- sentiments %>% 
+    group_by(status_id) %>% 
+    dplyr::summarize(
+      sentiment = sum(sentiment),
+      total_sentence = sum(sentence_id),
+      total_word_count = sum(word_count)
+      )
+  
+  # join original data frame
+  df <- left_join( x = sentiments, y = tweets, by = "status_id") %>% 
+    dplyr::select(status_id, user_id, created_at, date, sentiment, VADER_text, retweet_count, 
+                  total_sentence, total_word_count, country, retweeted_user, cntry_id) %>%
+    add_zp()
+  
+  # Return dataframe
+  return(df)
+}
+
+# Function which calculates the sentiment of each tweet using 
+# any of the tidytext libraries: nrc, afinn, bing
+tidy_tweets <- function(x,y) {
+  # Define a subset of variables from existing tweets dataframe to be kept once sentiment has been obtained
+  imp_var <- c("status_id", "user_id", "date", "sentiment", "VADER_text", "total_sentence",
+               "total_word_count", "country", "retweeted_user", "cntry_id")
+  
+  ttws <- x[,c("status_id","VADER_text")] %>%
+    unnest_tokens(word, VADER_text) %>%
+    inner_join(get_sentiments(y))
+  
+  if (y == "nrc" | y == "bing") {
+    ttws <- ttws %>% filter(sentiment %in% c("positive","negative")) %>%
+      dplyr::count(status_id, sentiment) %>%
+      spread(sentiment, n, fill = 0) %>%
+      mutate(sentiment = positive - negative)
+  } else {
+    ttws <- ttws %>% group_by(status_id) %>%
+      summarise(sentiment = sum(value))
+  }
+  
+  ttws <- left_join( x = ttws, y = tweets, by = "status_id") %>% 
+    dplyr::select(status_id, user_id, created_at, date, sentiment, VADER_text, 
+                  retweet_count, country, retweeted_user, cntry_id) %>%
+    add_zp()
+  
+  return(ttws)
+}
+
+add_zp <- function(x) {
+  x <- x %>% 
+    mutate(sent_zscore = (sentiment - mean(sentiment)) / sd(sentiment), # z score
+           pos_sent = case_when(
+             sentiment == 0 ~ 0,
+             sentiment > 0 ~ 1,
+             sentiment < 0 ~ 2
+             ) # id for neutral, positive and negative sentiment
+           )
+}
+```
+
+
+# Run sentiment analysis
+```{r}
+coreNLP_sentiments <- get_sentiments_coreNLP(tweets)
+nrc_sentiments     <- tidy_tweets(tweets, "nrc")
+#affin_sentiments   <- tidy_tweets(tweets, "afinn")
+#bing_sentiments    <- tidy_tweets(tweets, "bing")
+```
+
+
+# Create word clouds
+```{r}
+apply_weightings <- function (x) {
+  x <- x[rep(row.names(x), x$retweet_count),c('status_id','VADER_text','retweet_count')]
+}
+
+
+word_count <- function(x) {
+  data(stop_words)
+  misc_words <- tibble(word = c("it's", "i've", "lot", "set", "he's", "rt", 
+                                "-", "anonymous", "http", "url_removed", "amp"))
+  x <- tibble(id = 1:nrow(x), text = x$VADER_text)
+  x$text <- gsub("[0-9]+", "", x$text)
+  x <- x %>% unnest_tokens(word, text)
+  x <- x %>% anti_join(stop_words)
+  x <- x %>% anti_join(misc_words)
+  x <- x %>% dplyr::count(word, sort = TRUE)
+}
+
+word_cloud <- function(x, y, z) {
+  x <- wordcloud(words = x$word, freq = x$n, min.freq = y,
+          max.words = z, random.order=FALSE, rot.per=0.35,
+          colors=brewer.pal(8, "Dark2") )
+}
+
+filter_date <- function(x,y,z) {
+  x <- x %>% dplyr::filter(between(date, as.Date(y), as.Date(z) ) )
+}
+```
+
+
+```{r, fig.width=14}
+wt_nrc_sentiments <- apply_weightings(nrc_sentiments)
+word_count(wt_nrc_sentiments) %>% word_cloud(1000,1000)
+```
+
+
+
+
+
+```{r, fig.width=14}
+end_jan <- filter_date(coreNLP_sentiments, "2020-01-31", "2020-02-01")
+word_count(end_jan) %>% word_cloud(5,1000)
+```
+
+
+
+```{r}
+y <- "bing"
+imp_var <- c("user_id", "status_id", "created_at", "full_text_cleaned", "date")
+ttws <- x[,c("status_id","full_text_cleaned")] %>%
+  unnest_tokens(word, full_text_cleaned) %>%
+  inner_join(get_sentiments(y))
+ttws <- ttws %>% filter(sentiment %in% c("positive","negative")) %>%
+  dplyr::count(status_id, sentiment) %>%
+  spread(sentiment, n, fill = 0) %>%
+  mutate(sentiment = positive - negative)
+ttws <- merge(tweets[,imp_var], ttws, by = "status_id")
+```
+
+
+
+
+
+
+# organising data for analysis
+```{r}
+# tweet level sentiment score
+tweet_sent <- coreNLP_sentiments %>% 
+  group_by(status_id) %>% 
+  dplyr::summarize(
+    over_tweet_sent = sum(sentiment),
+    total_sentence = sum(sentence_id),
+    total_word_count = sum(word_count)
+    )
+  
+# join original data frame
+df <- left_join( x = tweet_sent, y = tweets, by = "status_id") %>% 
+  dplyr::select(status_id, user_id, date, over_tweet_sent, full_text_cleaned, total_sentence, total_word_count, country, retweeted_user, cntry_id )
+
+# add vars
+df <- df %>% 
+  mutate(sent_zscore = (over_tweet_sent - mean(over_tweet_sent)) / sd(over_tweet_sent), # z score
+         pos_sent = 
+           case_when(
+           over_tweet_sent == 0 ~ 0,
+           over_tweet_sent > 0 ~ 1,
+           over_tweet_sent < 0 ~ 2
+           ) # id for neutral, positive and negative sentiment
+         )
+
+```
+
+
+# Analysis
+
+The aim should be to conduct a tweet-level analysis, not a sentence level so it is important to check how the data frame containing the sentiment scores is structured and rearrange appropriately if required.
+
+Research questions:
+* How many of the tweets relate to the pandemic? What about if we restrict the sentiment analysis to those tweets? Do we arrive to a different temporal signature?
+
+Set font for graphics
+```{r}
+# load font
+font_add_google("Roboto Condensed", "robotocondensed")
+# automatically use showtext to render text
+showtext_auto()
+```
+
+# Plot Number of tweets by day
+
+This doesn't really tell up much as it is likely to be highly sensitive to the max_hour (e.g. if it was 6am, it would only capture very early tweets)
+```{r}
+df %>% group_by(date) %>% 
+  dplyr::summarise(Count = n()) %>% 
+  ggplot(., aes(x = date, y = Count)) +
+  geom_line() +
+  theme_tufte() +
+    theme(text = element_text(family="robotocondensed"))
+```
+
+## Distribution
+```{r}
+ggplot(data=df) +
+  geom_density(aes(x = over_tweet_sent), fill = "grey", alpha = 0.6) +
+  #facet_grid(. ~ cntry_id) +
+  theme_tufte() +
+    theme(text = element_text(family="robotocondensed"))
+```
+
+```{r}
+df %>% dplyr::filter(over_tweet_sent | 0) %>% 
+  ggplot() +
+  geom_density(aes(x = over_tweet_sent), fill = "grey", alpha = 0.6) +
+  #facet_grid(. ~ cntry_id) +
+  theme_tufte() +
+    theme(text = element_text(family="robotocondensed"))
+```
+
+
+```{r}
+ggplot(data=df) +
+  geom_density(aes(x = sent_zscore), fill = "grey", alpha = 0.6) +
+  #facet_grid(. ~ cntry_id) +
+  theme_tufte()
+```
+
+```{r}
+table(df$pos_sent)
+```
+
+```{r}
+tb_counts <- table(df$date, df$pos_sent)
+tb_counts
+```
+
+```{r}
+tb_prop <- prop.table(tb_counts, 1)
+tb_prop * 100
+```
+
+
+### Tweet level analysis
+
+To do:
+- normalise sentiment score to range from -1 to 1
+- try using the median sentiment score
+
+Overall sentiment
+```{r, fig.width=14}
+ggplot(df, aes(x = date, y = over_tweet_sent)) +
+  #geom_point(colour = "gray", alpha = 0.3, size = 1, shape=".") + 
+  geom_smooth(method = "loess", se = FALSE, size=2, span = 0.3, color="#238A8DFF") +
+#  facet_wrap(~ cntry_id, nrow = 5) + 
+  theme_tufte() + 
+  theme(text = element_text(family="robotocondensed")) +
+  labs(x= "Day",
+       y = "Tweet sentiment score") +
+  scale_y_continuous(limits = c(-0.5, 0.5))
+```
+
+```{r, fig.width=14}
+ggplot(df, aes(x = date, y = over_tweet_sent)) +
+  geom_point(colour = "gray", alpha = 0.3, size = 1, shape=".") + 
+  geom_smooth(method = "loess", se = FALSE, size=2, span = 0.3, color="#238A8DFF") +
+#  facet_wrap(~ cntry_id, nrow = 5) + 
+  theme_tufte() + 
+  theme(text = element_text(family="robotocondensed")) +
+  labs(x= "Day", y = "Tweet sentiment score")
+```
+
+
+ Positive and negative sentiment scores
+```{r, fig.width=14}
+df %>% dplyr::filter(over_tweet_sent | 0) %>% 
+  ggplot(aes(x = date, y = over_tweet_sent, colour = as.factor(pos_sent))) +
+  #geom_point(colour = "gray", alpha = 0.3, size = 3, shape=".") + 
+  geom_smooth(method = "loess", se = FALSE, size=2, span = 0.3, color="#737373") + 
+  geom_smooth(method = "loess", se = FALSE, size=2, formula = y ~ log(x), span = 0.2) +
+  scale_color_manual(values = c('darkblue', 'darkred')) +
+#  facet_wrap(~ cntry_id, nrow = 5) + 
+  theme_tufte() + 
+  theme(text = element_text(family="robotocondensed")) +
+  labs(x= "Day",
+       y = "Tweet sentiment score") +
+  scale_y_continuous(limits = c(-0.5, 0.5))
+```
+
+```{r}
+df %>% dplyr::filter(over_tweet_sent | 0) %>% 
+  ggplot(aes(x = date, y = over_tweet_sent, colour = as.factor(pos_sent))) +
+  geom_point(colour = "gray", alpha = 0.3, size = 1, shape=".") + 
+  geom_smooth(method = "loess", se = FALSE, size=2, formula = y ~ log(x), span = 0.2) +
+  scale_color_manual(values = c('darkblue', 'darkred')) +
+#  facet_wrap(~ cntry_id, nrow = 5) + 
+  theme_tufte() + 
+  theme(text = element_text(family="robotocondensed")) +
+  labs(x= "Day",
+       y = "Tweet sentiment score") +
+  scale_y_continuous(limits = c(-0.5, 0.5))
+```
+
+
+
+### Day level analysis
+
+Overall sentiment - mean
+```{r}
+df %>% group_by(date) %>% 
+  dplyr::summarise(mean_day_sent = mean(over_tweet_sent)) %>% 
+  ggplot(aes(x = date, y = mean_day_sent)) +
+  geom_point(colour = "gray", alpha = 0.5) + 
+  geom_line(size=2, color="#238A8DFF") +
+#  facet_wrap(~ cntry_id, nrow = 5) + 
+  theme_tufte() + 
+  theme(text = element_text(family="robotocondensed")) +
+  labs(x= "Day",
+       y = "Tweet sentiment score")
+```
+
+Overall sentiment - sum
+```{r}
+df %>% group_by(date) %>% 
+  dplyr::summarise(sum_day_sent = sum(over_tweet_sent)) %>% 
+  ggplot(aes(x = date, y = sum_day_sent)) +
+  geom_point(colour = "gray", alpha = 0.5) + 
+  geom_line(size=2, color="#238A8DFF") +
+#  facet_wrap(~ cntry_id, nrow = 5) + 
+  theme_tufte() + 
+  theme(text = element_text(family="robotocondensed")) +
+  labs(x= "Day",
+       y = "Tweet sentiment score")
+```
+
+
+
+
+
+## Code for selecting colour pallettes
+```{r}
+# Hexadecimal color specification 
+brewer.pal(n = 8, name = "Greys")
+```
+
+```{r}
+# View a single RColorBrewer palette by specifying its name
+display.brewer.pal(n = 8, name = 'Greys')
+```
+
+```{r, fig.height=7}
+display.brewer.all()
+```
+
+
+
+
+
+# Misc
+```{r}
+# Clean tweets
+#tweets <- tweets %>% 
+#  # Convert text to lowercase
+#  mutate(full_text_cleaned = full_text %>% str_to_lower) %>%
+#  # Remove unwanted characters
+#  mutate(full_text_cleaned = full_text_cleaned %>% str_remove_all(pattern = '\\n')) %>% 
+#  mutate(full_text_cleaned = full_text_cleaned %>% str_remove_all(pattern = '&amp')) %>% 
+#  # Remove websites
+#  mutate(full_text_cleaned = full_text_cleaned %>% str_remove_all(pattern = 'https://t.co/[a-z,A-Z,0-9]*')) %>% 
+#  mutate(full_text_cleaned = full_text_cleaned %>% str_remove_all(pattern = 'http://t.co/[a-z,A-Z,0-9]*')) %>% 
+#  mutate(full_text_cleaned = full_text_cleaned %>% str_remove_all(pattern = 'https')) %>% 
+#  mutate(full_text_cleaned = full_text_cleaned %>% str_remove_all(pattern = 'http')) %>% 
+#  # Remove hashtags
+#  mutate(full_text_cleaned = full_text_cleaned %>% str_remove_all(pattern = '#')) %>% 
+#  # Remove entire hashtags (optional)
+#  # mutate(full_text_cleaned = full_text_cleaned %>% str_remove_all(pattern = '#[a-z,A-Z]*')) %>% 
+#  # Remove accounts
+#  mutate(full_text_cleaned = full_text_cleaned %>% str_remove_all(pattern = '@[a-z,A-Z]*')) %>% 
+#  # Remove retweet text
+#  mutate(full_text_cleaned = full_text_cleaned %>% str_remove_all(pattern = 'rt [a-z,A-Z]*: ')) %>% 
+#  mutate(full_text_cleaned = full_text_cleaned %>% str_remove(pattern = '^(rt)')) %>% 
+#  mutate(full_text_cleaned = full_text_cleaned %>% str_remove_all(pattern = '\\_')) %>%
+#  mutate(full_text_cleaned = full_text_cleaned %>% str_remove_all(pattern = 'ht [a-z,A-Z]*: ')) %>% 
+#  mutate(full_text_cleaned = full_text_cleaned %>% str_remove(pattern = '^(ht)'))
+```
+
